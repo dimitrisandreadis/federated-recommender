@@ -1,0 +1,389 @@
+!pip -q install pandas ujson
+
+import gzip, ujson, pandas as pd, os
+os.makedirs("/content/amazon2014", exist_ok=True)
+
+CAT = "Electronics"
+url = f"http://snap.stanford.edu/data/amazon/productGraph/categoryFiles/reviews_{CAT}_5.json.gz"
+path = f"/content/amazon2014/reviews_{CAT}_5.json.gz"
+
+!curl -L --fail --retry 3 -A "Mozilla/5.0" -o "$path" "$url"
+
+# Stream-parse into a DataFrame
+rows = []
+with gzip.open(path, "rt", encoding="utf-8") as f:
+    for line in f:
+        r = ujson.loads(line)
+        rows.append((r.get("reviewerID"), r.get("asin"),
+                     r.get("overall"), r.get("unixReviewTime")))
+df = pd.DataFrame(rows, columns=["user","item","rating","ts"])
+df.head(), df.shape
+
+import pandas as pd
+import numpy as np
+
+df = df.sort_values(["user","ts"])
+user_counts = df["user"].value_counts()
+keep_users = user_counts[user_counts > 100].index
+df = df[df["user"].isin(keep_users)].copy()
+print("Rows after filter:", len(df))
+print("Users kept:", df["user"].nunique())
+print("Min reviews per kept user:", df["user"].value_counts().min())
+
+!pip -q install torch faiss-cpu tqdm numpy pandas scikit-learn
+
+# ==== Imports ====
+import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+from sklearn.metrics import (roc_auc_score, average_precision_score, f1_score, accuracy_score, log_loss, brier_score_loss, balanced_accuracy_score)
+
+# ============================================================
+# 0) ID indexing only (NO global POS_THRESH here)
+# ============================================================
+df = df.copy()
+
+users = pd.Index(df['user'].unique())
+items = pd.Index(df['item'].unique())
+u2i = {u:i for i,u in enumerate(users)}
+v2i = {v:i for i,v in enumerate(items)}
+df['u'] = df['user'].map(u2i).astype('int64')
+df['v'] = df['item'].map(v2i).astype('int64')
+
+n_users, n_items = len(users), len(items)
+print(f"n_users={n_users}  n_items={n_items}  interactions={len(df)}")
+
+# ============================================================
+# (C) Leave-K-out split (temporal, pointwise)
+# ============================================================
+K_TEST = 10   # last 5 -> TEST
+K_VAL  = 10   # 5 before test -> VAL
+
+df = df.sort_values(['u','ts'])
+idx_in_user = df.groupby('u').cumcount()
+n_in_user   = df.groupby('u')['u'].transform('size')
+
+test_mask = idx_in_user >= (n_in_user - K_TEST)
+val_mask  = (idx_in_user >= (n_in_user - (K_TEST + K_VAL))) & (idx_in_user < n_in_user - K_TEST)
+train_mask = ~(test_mask | val_mask)
+
+train = df[train_mask].copy()
+val   = df[val_mask].copy()
+test  = df[test_mask].copy()
+
+print(
+    f"users kept={train['u'].nunique()} | "
+    f"train rows={len(train)}  val rows={len(val)}  test rows={len(test)}  "
+    f"(K_TEST={K_TEST}, K_VAL={K_VAL})"
+)
+
+# ============================================================
+# NEW: Per-user personalized thresholds (computed on train ∪ val only)
+# ============================================================
+# Choose a personalization rule. Two good options:
+
+PERSONAL_RULE = "percentile"   # or "mean_plus_stdfrac"
+
+q = 0.8
+alpha = 0.0
+history = pd.concat([train, val], ignore_index=True)
+user_group = history.groupby('u')
+cnt = user_group.size()
+
+if PERSONAL_RULE == "percentile":
+    user_thr = history.groupby('u')['rating'].quantile(q)
+else:  # "mean_plus_stdfrac"
+    mu = history.groupby('u')['rating'].mean()
+    sd = history.groupby('u')['rating'].std().fillna(0.0)
+    user_thr = mu + alpha * sd
+
+# Helper to binarize a split with per-user thresholds
+def apply_personalized_binarization(df_part, thr_map):
+    # map threshold per user; fallback to default_thr if missing
+    t = df_part['u'].map(thr_map)
+    y = (df_part['rating'] >= t).astype(np.float32)
+    out = df_part.copy()
+    out['y'] = y
+    return out
+
+train = apply_personalized_binarization(train, user_thr)
+val   = apply_personalized_binarization(val,   user_thr)
+test  = apply_personalized_binarization(test,  user_thr)
+
+print("Personalized label prevalence:", f"train={train['y'].mean():.3f}  val={val['y'].mean():.3f}  test={test['y'].mean():.3f}")
+
+item_counts = train['v'].value_counts().sort_index()
+items_sorted = item_counts.sort_values(ascending=False).index
+users_per_item = train.groupby('v')['u'].unique() 
+user_to_server = {}
+n_servers = 5                               
+server_user_counts = np.zeros(n_servers, int)     
+
+for item in items_sorted:       
+    users_for_item = users_per_item[item]  # array of user ids that touched this item
+    for u in users_for_item:
+        if u in user_to_server:
+            continue
+        s = int(server_user_counts.argmin())
+        user_to_server[u] = s
+        server_user_counts[s] += 1
+all_users = set(train['u'].unique())
+unassigned = all_users.difference(user_to_server.keys())
+for u in unassigned:
+    s = int(server_user_counts.argmin())
+    user_to_server[u] = s
+    server_user_counts[s] += 1
+
+print("Users per server:", server_user_counts)
+print("Total users:", len(user_to_server))
+
+# ============================================================
+# 1) Shard users across servers (federated clients)
+# ============================================================
+N_SERVERS = n_servers  # change if you want
+#user_shards = np.array_split(np.arange(n_users), N_SERVERS)
+user_shards = []
+for sid in range(N_SERVERS):
+    users_s = [u for u, srv in user_to_server.items() if srv == sid]
+    users_s = np.array(sorted(users_s), dtype=int)  # sorting just for readability
+    user_shards.append(users_s)
+
+server_frames = []
+for sid in range(N_SERVERS):
+    shard_users = set(user_shards[sid])
+    part = train[train['u'].isin(shard_users)].copy()
+    server_frames.append(part)
+    #print(f"server {sid}: users={len(shard_users)}  rows={len(part)}")
+
+# ============================================================
+# 2) Dataset (pointwise)
+# ============================================================
+class PointwiseBinary(Dataset):
+    def __init__(self, df_part):
+        self.u = torch.as_tensor(df_part['u'].values, dtype=torch.long)
+        self.v = torch.as_tensor(df_part['v'].values, dtype=torch.long)
+        self.y = torch.as_tensor(df_part['y'].values, dtype=torch.float32)
+    def __len__(self): return len(self.u)
+    def __getitem__(self, idx):
+        return self.u[idx], self.v[idx], self.y[idx]
+
+# ============================================================
+# 3) Model: MF with BCE logits
+# ============================================================
+class MF_BCE(nn.Module):
+    def __init__(self, n_users, n_items, dim=64, dropout_p=0.0):
+        super().__init__()
+        self.user = nn.Embedding(n_users, dim)
+        self.item = nn.Embedding(n_items, dim)
+        self.bu   = nn.Embedding(n_users, 1)
+        self.bi   = nn.Embedding(n_items, 1)
+        self.mu   = nn.Parameter(torch.zeros(1))
+        self.drop = nn.Dropout(dropout_p)
+        nn.init.normal_(self.user.weight, std=0.01)
+        nn.init.normal_(self.item.weight, std=0.01)
+        nn.init.zeros_(self.bu.weight); nn.init.zeros_(self.bi.weight)
+
+    def logits(self, u, i):
+        uE = self.drop(self.user(u))
+        iE = self.drop(self.item(i))
+        return (uE * iE).sum(-1) + self.bu(u).squeeze(-1) + self.bi(i).squeeze(-1) + self.mu
+
+# ============================================================
+# Helpers for FedAvg
+# ============================================================
+def get_state(m):  return {k: v.detach().cpu().clone() for k,v in m.state_dict().items()}
+def set_state(m,s): m.load_state_dict(s)
+
+def avg_states_weighted(states, weights):
+    keys = states[0].keys()
+    Z = float(sum(weights))
+    return {k: sum(w*s[k] for w, s in zip(weights, states)) / Z for k in keys}
+
+# ============================================================
+# 4) Federated training (FedAvg, weighted; class-balanced BCE per client)
+# ============================================================
+DIM=64; ROUNDS=5; LOCAL_EPOCHS=20; BATCH=1024; LR=1e-3; WD=1e-4
+DROPOUT_P = 0.1
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+global_model = MF_BCE(n_users, n_items, dim=DIM, dropout_p=DROPOUT_P).to(DEVICE)
+global_state = get_state(global_model)
+local_final_states = {}
+
+for rd in range(ROUNDS):
+    print(f"\n=== Round {rd+1}/{ROUNDS} ===")
+    server_states, server_weights = [], []
+    active = np.arange(N_SERVERS)  # (optionally, sample a subset each round)
+    for sid in active:
+        local = MF_BCE(n_users, n_items, dim=DIM, dropout_p=DROPOUT_P).to(DEVICE)
+        set_state(local, global_state)
+        item_before = local.item.weight.detach().clone()
+        opt = torch.optim.Adam(local.parameters(), lr=LR, weight_decay=WD)
+        part = server_frames[sid]
+        p_rate = float(part['y'].mean())
+        p_rate = min(1-1e-6, max(1e-6, p_rate))
+        w_pos = 0.5 / p_rate
+        w_neg = 0.5 / (1 - p_rate)
+        dl = DataLoader(PointwiseBinary(part), batch_size=BATCH, shuffle=True, drop_last=False)
+        local.train()
+        for _ in range(LOCAL_EPOCHS):
+            for u, v, y in dl:
+                u, v, y = u.to(DEVICE), v.to(DEVICE), y.to(DEVICE)
+                logits = local.logits(u, v)
+                w = torch.where(y > 0.5, torch.tensor(w_pos, device=logits.device), torch.tensor(w_neg, device=logits.device))
+                loss = F.binary_cross_entropy_with_logits(logits, y, weight=w)
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+        item_after = local.item.weight.detach().clone()
+        change_per_item = (item_after - item_before).norm(dim=1)
+        server_states.append(get_state(local))
+        server_weights.append(len(part))
+        if rd == ROUNDS - 1:
+            local_final_states[sid] = get_state(local)
+
+    global_state = avg_states_weighted(server_states, server_weights)
+    set_state(global_model, global_state)
+    print("Aggregated.")
+
+model = global_model.eval()
+
+
+# ============================================================
+# 5) Pointwise eval utils (supports per-user thresholds)
+# ============================================================
+def score_df_pairs(model, df_pairs, batch=4096, device=DEVICE, temperature=None):
+    model.eval()
+    u_idx = df_pairs['u'].values.astype(np.int64)
+    v_idx = df_pairs['v'].values.astype(np.int64)
+    y_np  = df_pairs['y'].values.astype(np.float32)
+
+    u = torch.as_tensor(u_idx, dtype=torch.long)
+    v = torch.as_tensor(v_idx, dtype=torch.long)
+
+    logits_all = []
+    with torch.no_grad():
+        for i in range(0, len(u), batch):
+            uu = u[i:i+batch].to(device)
+            vv = v[i:i+batch].to(device)
+            logits = model.logits(uu, vv)
+            if temperature is not None:
+                logits = logits / temperature
+            logits_all.append(logits.detach().cpu())
+    logits = torch.cat(logits_all).numpy()
+    probs = 1 / (1 + np.exp(-logits))
+    return logits, probs, y_np, u_idx
+
+def pr_auc_negative(y, probs):
+    y_neg = 1 - y
+    p_neg = 1 - probs
+    try:
+        return average_precision_score(y_neg, p_neg)
+    except ValueError:
+        return float('nan')
+
+def pick_threshold_on_val(probs, y, strategy="max_balacc"):
+    cand = np.linspace(0.01, 0.99, 99)
+    best_thr, best = 0.5, -1
+    for thr in cand:
+        pred = (probs >= thr).astype(int)
+        metric = balanced_accuracy_score(y, pred) if strategy=="max_balacc" else f1_score(y, pred, zero_division=0)
+        if metric > best:
+            best, best_thr = metric, thr
+    return best_thr
+
+def pick_thresholds_per_user(probs, y, u_ids, min_obs=3, strategy="max_balacc"):
+    """
+    Returns: (user_thr: dict[u->thr], global_thr: float)
+    Users with < min_obs or single-class val fall back to global_thr.
+    """
+    dfv = pd.DataFrame({"u": u_ids, "y": y, "p": probs})
+    global_thr = pick_threshold_on_val(dfv["p"].values, dfv["y"].values, strategy=strategy)
+
+    user_thr = {}
+    cand = np.linspace(0.01, 0.99, 99)
+    for u, g in dfv.groupby("u"):
+        if len(g) < min_obs or g["y"].nunique() < 2:
+            continue
+        yy = g["y"].values; pp = g["p"].values
+        best, best_t = -1, global_thr
+        for thr in cand:
+            pred = (pp >= thr).astype(int)
+            metric = balanced_accuracy_score(yy, pred) if strategy=="max_balacc" \
+                     else f1_score(yy, pred, zero_division=0)
+            if metric > best:
+                best, best_t = metric, thr
+        user_thr[u] = best_t
+    return user_thr, global_thr
+
+def eval_pointwise(model, df_pairs, thr=None, name="set", temperature=None, user_thr=None):
+    logits, probs, y, u_ids = score_df_pairs(model, df_pairs, temperature=temperature)
+
+    if user_thr is not None:
+        assert thr is not None, "Provide a global fallback threshold when using user_thr."
+        thr_row = np.vectorize(lambda uu: user_thr.get(uu, thr))(u_ids)
+        y_pred = (probs >= thr_row).astype(int)
+    else:
+        thr = 0.5 if thr is None else thr
+        y_pred = (probs >= thr).astype(int)
+
+    try: roc = roc_auc_score(y, probs)
+    except ValueError: roc = float('nan')
+    try: prauc = average_precision_score(y, probs)
+    except ValueError: prauc = float('nan')
+    prauc_neg = pr_auc_negative(y, probs)
+    try: ll = log_loss(y, probs, labels=[0,1])
+    except ValueError: ll = float('nan')
+    try: br = brier_score_loss(y, probs)
+    except ValueError: br = float('nan')
+
+    acc = accuracy_score(y, y_pred)
+    f1  = f1_score(y, y_pred, zero_division=0)
+    balacc = balanced_accuracy_score(y, y_pred)
+
+    print(f"[{name}]  ROC-AUC={roc:.4f}  PR-AUC={prauc:.4f}  PR-AUC(neg)={prauc_neg:.4f}  "
+          f"LogLoss={ll:.4f}  Brier={br:.4f}  Acc={acc:.4f}  BalAcc={balacc:.4f}  F1={f1:.4f}")
+    return {"roc": roc, "prauc": prauc, "prauc_neg": prauc_neg,
+            "logloss": ll, "brier": br, "acc": acc, "balacc": balacc, "f1": f1}
+
+# ============================================================
+# 6) Pick per-user thresholds on VAL (balanced accuracy), evaluate GLOBAL vs LOCALs
+# ============================================================
+val_pairs  = val[['u','v','y']].copy()
+test_pairs = test[['u','v','y']].copy()
+
+def build_model_from_state(state):
+    m = MF_BCE(n_users, n_items, dim=DIM, dropout_p=DROPOUT_P).to(DEVICE)
+    set_state(m, state); m.eval(); return m
+
+global_model = build_model_from_state(global_state)
+
+# Per-user thresholds from validation
+_, val_probs, val_y, val_uids = score_df_pairs(global_model, val_pairs)
+user_thr, global_thr = pick_thresholds_per_user(val_probs, val_y, val_uids,
+                                                min_obs=3, strategy="max_balacc")
+print(f"\nGlobal fallback threshold (val, max balanced accuracy): {global_thr:.4f}")
+print(f"Users with personalized thresholds: {len(user_thr)}\n")
+
+print("=== GLOBAL MODEL (per-user thresholds) ===")
+_ = eval_pointwise(global_model, val_pairs,  thr=global_thr, name="global-val",  user_thr=user_thr)
+_ = eval_pointwise(global_model, test_pairs, thr=global_thr, name="global-test", user_thr=user_thr)
+
+rows = []
+print("\n=== LOCAL MODELS (final round, per-user thresholds) ===")
+for sid in range(N_SERVERS):
+    local_model = build_model_from_state(local_final_states[sid])
+    print(f"\n-- server {sid} --")
+    lv = eval_pointwise(local_model, val_pairs,  thr=global_thr, name=f"local{sid}-val",  user_thr=user_thr)
+    lt = eval_pointwise(local_model, test_pairs, thr=global_thr, name=f"local{sid}-test", user_thr=user_thr)
+    rows.append({
+        "server": sid,
+        "val_ROC": lv["roc"], "val_PRAUC": lv["prauc"], "val_PRAUC_neg": lv["prauc_neg"],
+        "val_BalAcc": lv["balacc"], "val_F1": lv["f1"], "val_Acc": lv["acc"],
+        "test_ROC": lt["roc"], "test_PRAUC": lt["prauc"], "test_PRAUC_neg": lt["prauc_neg"],
+        "test_BalAcc": lt["balacc"], "test_F1": lt["f1"], "test_Acc": lt["acc"]
+    })
+
+summary_df = pd.DataFrame(rows).sort_values("test_ROC", ascending=False)
+print("\n=== Summary (sorted by test ROC-AUC) ===")
+print(summary_df.to_string(index=False))
